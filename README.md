@@ -125,6 +125,24 @@ powershell.exe -STA -File scripts\integration-test-files.ps1  # file-drop handli
 - **Nothing happens** — check `Watching clipboard` is enabled in the tray menu,
   and see `claude-clip.log`.
 
+## Releasing
+
+Releases are automated by [`.github/workflows/release.yml`](.github/workflows/release.yml).
+On every push to `main` it reads the version from `Cargo.toml`; if a `v<version>`
+release doesn't exist yet, it builds on Windows and publishes that release with
+the `claude-clip-v<version>.exe` binary attached. Ordinary commits are no-ops.
+
+**To cut a release:** bump `version` in `Cargo.toml`, commit, and push to `main`.
+
+```toml
+# Cargo.toml
+[package]
+version = "0.2.0"   # ← bump this
+```
+
+The first push of the workflow publishes the current version (`v0.1.0`). To
+remove a release: `gh release delete v0.1.0 --cleanup-tag`.
+
 ## Documentation
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — module map, data flow, threading

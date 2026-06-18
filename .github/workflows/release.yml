@@ -1,0 +1,83 @@
+name: Release
+
+# Cut a GitHub release whenever main advances AND the version in Cargo.toml names
+# a release that doesn't exist yet. So: bump `version` in Cargo.toml to publish;
+# ordinary commits to main are no-ops (the build only runs for a new version).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write # required to create tags + releases
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history so release notes can diff against prior tags
+
+      - name: Resolve version from Cargo.toml
+        id: ver
+        shell: pwsh
+        run: |
+          $m = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $m) { Write-Error 'could not find version in Cargo.toml'; exit 1 }
+          $v = $m.Matches[0].Groups[1].Value
+          "version=$v" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "tag=v$v"    | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Cargo.toml version = $v (tag v$v)"
+
+      - name: Does this release already exist?
+        id: check
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view "${{ steps.ver.outputs.tag }}" 2>$null | Out-Null
+          if ($LASTEXITCODE -eq 0) {
+            "exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "${{ steps.ver.outputs.tag }} already exists - nothing to do."
+          } else {
+            "exists=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            Write-Host "${{ steps.ver.outputs.tag }} is new - will build and publish."
+          }
+
+      # GNU toolchain matches local dev and lets build.rs embed the icon/manifest
+      # via windres (present on the runner). If windres were missing, build.rs
+      # degrades gracefully and the build still succeeds.
+      - name: Install Rust (GNU)
+        if: steps.check.outputs.exists == 'false'
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable-x86_64-pc-windows-gnu
+
+      - name: Cache cargo
+        if: steps.check.outputs.exists == 'false'
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        if: steps.check.outputs.exists == 'false'
+        run: cargo test --release
+
+      - name: Build
+        if: steps.check.outputs.exists == 'false'
+        run: cargo build --release
+
+      - name: Publish release
+        if: steps.check.outputs.exists == 'false'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $asset = "claude-clip-$tag.exe"
+          Copy-Item target/release/claude-clip.exe $asset
+          gh release create $tag $asset --title "ClaudeClip $tag" --generate-notes
+          Write-Host "Published $tag with asset $asset"
