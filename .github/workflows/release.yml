@@ -41,13 +41,15 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release view "${{ steps.ver.outputs.tag }}" 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            "exists=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          $exists = $LASTEXITCODE -eq 0
+          "exists=$($exists.ToString().ToLower())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          if ($exists) {
             Write-Host "${{ steps.ver.outputs.tag }} already exists - nothing to do."
           } else {
-            "exists=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
             Write-Host "${{ steps.ver.outputs.tag }} is new - will build and publish."
           }
+          # gh's non-zero exit (release not found) must not fail this step.
+          exit 0
 
       # GNU toolchain matches local dev and lets build.rs embed the icon/manifest
       # via windres (present on the runner). If windres were missing, build.rs
