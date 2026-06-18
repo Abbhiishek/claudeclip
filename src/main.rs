@@ -17,6 +17,7 @@ mod autostart;
 mod capture;
 mod config;
 mod installer;
+mod updater;
 mod util;
 
 use anyhow::{anyhow, Result};
@@ -122,6 +123,9 @@ fn run() -> Result<()> {
     }
 
     log::info!("=== ClaudeClip starting (v{}) ===", env!("CARGO_PKG_VERSION"));
+
+    // Remove the .old.exe left by a completed self-update on the previous run.
+    updater::cleanup_old_exe();
 
     // Single instance: a named mutex. If it already exists, another copy is running.
     unsafe {

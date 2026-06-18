@@ -3,7 +3,8 @@
 
 use crate::capture::{self, CaptureKind};
 use crate::config::Config;
-use crate::{autostart, util::wide};
+use crate::{autostart, updater, util::wide};
+use std::sync::atomic::Ordering;
 use anyhow::{bail, Result};
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -33,7 +34,8 @@ const SM_CYSMICON: i32 = 50;
 const LR_DEFAULTCOLOR: u32 = 0;
 
 // --- message / id constants ------------------------------------------------
-const WMAPP_TRAYMSG: u32 = 0x8000 + 1; // WM_APP + 1
+const WMAPP_TRAYMSG: u32 = 0x8000 + 1;      // WM_APP + 1
+const WMAPP_UPDATE_FOUND: u32 = 0x8000 + 2; // WM_APP + 2 — posted by update-checker thread
 const TRAY_UID: u32 = 0x4343; // "CC"
 
 const WM_DESTROY: u32 = 0x0002;
@@ -87,6 +89,7 @@ const ID_OPEN_CONFIG: usize = 4;
 const ID_OPEN_LOG: usize = 5;
 const ID_ABOUT: usize = 6;
 const ID_EXIT: usize = 7;
+const ID_UPDATE: usize = 8;
 
 /// Shared application state. Lives on the heap for the duration of the message
 /// loop; a raw pointer is stashed in the window's `GWLP_USERDATA`.
@@ -140,6 +143,7 @@ pub fn run_app(config: Config, config_path: PathBuf, log_path: PathBuf) -> Resul
             log::warn!("AddClipboardFormatListener failed");
         }
         add_tray(&*app_ptr);
+        spawn_update_checker(hwnd);
         log::info!(
             "running; save_dir={}",
             (*app_ptr).config.save_dir.display()
@@ -244,6 +248,18 @@ unsafe extern "system" fn wndproc(
             }
             WMAPP_TRAYMSG => {
                 on_tray_message(app, hwnd, wparam, lparam);
+                return 0;
+            }
+            WMAPP_UPDATE_FOUND => {
+                if let Ok(g) = updater::PENDING_UPDATE.lock() {
+                    if let Some(ref r) = *g {
+                        let body = format!(
+                            "v{} is ready — right-click the tray icon to install.",
+                            r.version
+                        );
+                        show_balloon(app, "ClaudeClip update available", &body);
+                    }
+                }
                 return 0;
             }
             WM_DESTROY => {
@@ -417,8 +433,24 @@ unsafe fn show_menu(app: &App, hwnd: HWND, x: i32, y: i32) {
         return;
     }
 
+    // Snapshot update state before building the menu (avoids holding the lock
+    // across Win32 calls).
+    let pending_version: Option<String> = updater::PENDING_UPDATE
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|r| r.version.clone()));
+    let is_downloading = updater::DOWNLOADING.load(Ordering::Relaxed);
+
     append(menu, MF_STRING | MF_DISABLED | MF_GRAYED, 0, "ClaudeClip");
     append_separator(menu);
+
+    if is_downloading {
+        append(menu, MF_STRING | MF_GRAYED | MF_DISABLED, 0, "Downloading update…");
+        append_separator(menu);
+    } else if let Some(ref ver) = pending_version {
+        append(menu, MF_STRING, ID_UPDATE, &format!("Install update v{ver}…"));
+        append_separator(menu);
+    }
 
     let enabled_flags = MF_STRING | if app.enabled.get() { MF_CHECKED } else { 0 };
     append(menu, enabled_flags, ID_TOGGLE_ENABLED, "Watching clipboard");
@@ -472,6 +504,36 @@ unsafe fn show_menu(app: &App, hwnd: HWND, x: i32, y: i32) {
                 .arg(&app.log_path)
                 .spawn();
         }
+        ID_UPDATE => {
+            if !updater::DOWNLOADING.load(Ordering::Relaxed) {
+                let info = updater::PENDING_UPDATE
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|r| (r.version.clone(), r.download_url.clone())));
+                if let Some((version, download_url)) = info {
+                    updater::DOWNLOADING.store(true, Ordering::Relaxed);
+                    show_balloon(app, "Downloading update…", "Installing the latest version of ClaudeClip.");
+                    let release = updater::Release { version, download_url };
+                    let hwnd_val = hwnd as usize;
+                    std::thread::spawn(move || {
+                        match updater::download_and_replace(&release) {
+                            Ok(()) => {
+                                // Spawn the new version, then ask the UI thread to
+                                // shut down cleanly (removes the tray icon, etc.).
+                                if let Ok(exe) = std::env::current_exe() {
+                                    let _ = std::process::Command::new(exe).spawn();
+                                }
+                                unsafe { PostMessageW(hwnd_val as HWND, WM_DESTROY, 0, 0) };
+                            }
+                            Err(e) => {
+                                log::error!("update failed: {e:#}");
+                                updater::DOWNLOADING.store(false, Ordering::Relaxed);
+                            }
+                        }
+                    });
+                }
+            }
+        }
         ID_ABOUT => show_about(hwnd),
         ID_EXIT => {
             DestroyWindow(hwnd);
@@ -503,4 +565,32 @@ unsafe fn show_about(hwnd: HWND) {
     );
     let title = wide("About ClaudeClip");
     MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONINFORMATION);
+}
+
+// ---------------------------------------------------------------------------
+// Auto-update checker
+// ---------------------------------------------------------------------------
+
+/// Spawn a background thread that polls for updates on startup and every 24 h.
+/// When a newer release is found, it stores it in `updater::PENDING_UPDATE` and
+/// posts `WMAPP_UPDATE_FOUND` to the tray window.
+fn spawn_update_checker(hwnd: HWND) {
+    // HWND is a raw pointer and not Send, so transmit it as a plain integer.
+    let hwnd_val = hwnd as usize;
+    std::thread::spawn(move || {
+        // Short initial delay so the app is fully up before hitting the network.
+        std::thread::sleep(std::time::Duration::from_secs(15));
+        loop {
+            if let Some(release) = updater::check_for_update() {
+                log::info!("update available: v{}", release.version);
+                if let Ok(mut g) = updater::PENDING_UPDATE.lock() {
+                    *g = Some(release);
+                }
+                unsafe {
+                    PostMessageW(hwnd_val as HWND, WMAPP_UPDATE_FOUND, 0, 0);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(24 * 3600));
+        }
+    });
 }

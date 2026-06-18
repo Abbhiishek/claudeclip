@@ -1,6 +1,6 @@
 [package]
 name = "claude-clip"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Watches the Windows clipboard for screenshots/images and puts a pasteable file path on the clipboard for Claude Code."
 authors = ["Abhishek"]
@@ -19,6 +19,7 @@ toml = "0.8"
 dirs = "5"
 winreg = "0.52"
 png = "0.17"
+ureq = { version = "2", features = ["json"] }
 
 [dependencies.windows-sys]
 version = "0.59"
